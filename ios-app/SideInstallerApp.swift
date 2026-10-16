@@ -21,8 +21,15 @@ struct SideInstallerApp: App {
 
     init() {
         // A pairing code still up from a run that was killed means nothing now.
+        #if SIDEINSTALLER_EMBEDDED
+        if !SIEmbeddedIsLiveProcess() {
+            PairingLiveActivity.shared.endLeftovers()
+            PairingNotification.shared.reset()
+        }
+        #else
         PairingLiveActivity.shared.endLeftovers()
         PairingNotification.shared.reset()
+        #endif
     }
 
     var body: some Scene {
@@ -58,6 +65,13 @@ struct SideInstallerApp: App {
             }
             .animation(.smooth(duration: 0.5), value: hasAcceptedTOS)
             .animation(.smooth(duration: 0.5), value: hasCompletedAccountSetup)
+            #if SIDEINSTALLER_EMBEDDED
+            .safeAreaInset(edge: .top) {
+                if !SIEmbeddedIsLiveProcess() {
+                    EmbeddedLiveContainerBar().environmentObject(engine)
+                }
+            }
+            #endif
             // Auto-start LocalDevVPN on activation; `autoStartVPNIfWanted`
             // checks the setting and other conditions.
             .onChange(of: scenePhase) { _, phase in

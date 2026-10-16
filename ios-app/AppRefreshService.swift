@@ -62,13 +62,26 @@ final class AppRefreshService {
         return Inventory(entries: matched.entries, unmatched: matched.unmatched, jobs: jobs)
     }
 
-    func refreshAll(update: Update = { _, _ in }) async throws -> RefreshAllResult {
+    func withExclusiveOperation<T>(_ operation: @MainActor () async throws -> T) async throws -> T {
         let engine = Engine.shared
         guard !isRefreshing, !engine.isRunning else {
             throw EngineError.message(L("An install or refresh is already running. Wait for it to finish, then refresh."))
         }
         isRefreshing = true
         defer { isRefreshing = false }
+        #if SIDEINSTALLER_EMBEDDED
+        let lease = try EmbeddedRefreshLease()
+        defer { withExtendedLifetime(lease) {} }
+        #endif
+        return try await operation()
+    }
+
+    func refreshAll(update: Update = { _, _ in }) async throws -> RefreshAllResult {
+        try await withExclusiveOperation { try await performRefreshAll(update: update) }
+    }
+
+    private func performRefreshAll(update: Update) async throws -> RefreshAllResult {
+        let engine = Engine.shared
         try Task.checkCancellation()
         update([], L("Getting ready"))
 

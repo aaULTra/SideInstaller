@@ -1,0 +1,119 @@
+name: Build LiveContainer + SideInstaller
+
+on:
+  push:
+    branches: [feature/livecontainer-sideinstaller]
+  pull_request:
+    paths: ['embedded/**', 'ios-app/**', '.github/workflows/build-livecontainer.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: embedded-si-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            ios-app
+            ios-live-activity
+            rust-core
+            embedded
+      - name: Check out pinned LiveContainer and its submodules
+        uses: actions/checkout@v4
+        with:
+          repository: LiveContainer/LiveContainer
+          ref: 4dbe0f9a626de801184a42c0be8d2cb105058e3d
+          submodules: recursive
+          path: vendor-livecontainer
+      - name: Install build tools
+        run: |
+          brew install xcodegen ldid
+          python3 -m pip install --break-system-packages pyyaml
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+          xcodebuild -version
+      - name: Adapt the embedded host and guest project
+        run: |
+          python3 -m unittest discover -s embedded -p 'test_*.py' -v
+          python3 embedded/prepare_livecontainer.py vendor-livecontainer
+          swiftc -D SIDEINSTALLER_EMBEDDED ios-app/EmbeddedSigningIdentity.swift embedded/IdentityTests.swift -o /tmp/si-identity-tests
+          /tmp/si-identity-tests
+          python3 - <<'PY'
+          import yaml
+          from pathlib import Path
+          path = Path('project.yml')
+          project = yaml.safe_load(path.read_text())
+          target = project['targets']['SideInstaller']
+          target['sources'].append({'path': 'embedded/Runtime.m'})
+          target['settings']['base']['SWIFT_ACTIVE_COMPILATION_CONDITIONS'] = '$(inherited) SIDEINSTALLER_EMBEDDED'
+          target['settings']['base']['SWIFT_OBJC_BRIDGING_HEADER'] = 'embedded/Runtime.h'
+          path.write_text(yaml.safe_dump(project, sort_keys=False))
+          PY
+      - name: Type-check embedded SideInstaller against the iOS SDK
+        run: |
+          set -o pipefail
+          xcrun --sdk iphoneos swiftc -typecheck -parse-as-library -swift-version 5 \
+            -module-name SideInstaller -target arm64-apple-ios17.4 \
+            -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" -I rust-core/include \
+            -D SIDEINSTALLER_EMBEDDED -import-objc-header embedded/Runtime.h \
+            ios-app/*.swift 2>&1 | tee embedded-typecheck.log
+      - name: Type-check host refresh bridge against the iOS SDK
+        run: |
+          set -o pipefail
+          xcrun --sdk iphoneos swiftc -typecheck -parse-as-library -swift-version 5 \
+            -module-name SideStoreSupport -target arm64-apple-ios17.5 \
+            -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -import-objc-header vendor-livecontainer/SideStoreSupport/SideStore-Bridging-Header.h \
+            vendor-livecontainer/SideStoreSupport/*.swift 2>&1 | tee embedded-host-typecheck.log
+      - name: Build LiveContainer and host refresh bridge
+        run: |
+          set -o pipefail
+          xcodebuild -project vendor-livecontainer/LiveContainer.xcodeproj -scheme LiveContainer \
+            -configuration Release -sdk iphoneos -arch arm64 \
+            -derivedDataPath build-embedded-lc IPHONEOS_DEPLOYMENT_TARGET=17.5 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM= \
+            build 2>&1 | tee embedded-host.log
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ios-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock', 'rust-core/Cargo.toml', 'rust-core/vendor/**/Cargo.toml') }}
+      - name: Build SideInstaller's existing FFI and embedded executable
+        run: |
+          set -o pipefail
+          bash build-rust.sh
+          xcodegen generate
+          xcodebuild -project SideInstaller.xcodeproj -scheme SideInstaller \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath build-embedded-si MARKETING_VERSION=1.5.2 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build 2>&1 | tee embedded-guest.log
+      - name: Convert embedded executable and verify combined IPA
+        env:
+          SI_SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/LiveContainer/dylibify/releases/download/1.0/dylibify -o dylibify
+          chmod +x dylibify
+          python3 embedded/package.py \
+            --host build-embedded-lc/Build/Products/Release-iphoneos/LiveContainer.app \
+            --guest build-embedded-si/Build/Products/Release-iphoneos/SideInstaller.app \
+            --dylibify dylibify --upstream vendor-livecontainer --output combined-output
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: LiveContainer-SideInstaller-experimental
+          path: |
+            combined-output/LiveContainer-SideInstaller-unsigned.ipa
+            combined-output/verification.json
+            embedded-*.log
+          if-no-files-found: ignore

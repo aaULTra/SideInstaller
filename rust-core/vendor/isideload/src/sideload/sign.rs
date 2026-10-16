@@ -42,7 +42,9 @@ pub fn sign(
         certificate_chain,
     );
 
-    let entitlements = entitlements(&profile, special, team);
+    let embedded_host = app.bundle.app_info.get("SIEmbeddedBuild").and_then(plist::Value::as_boolean) == Some(true)
+        && app.bundle.bundle_identifier() == Some(format!("com.aault.livecontainer.sideinstaller.{}", team.team_id).as_str());
+    let entitlements = entitlements(&profile, special, team, embedded_host);
 
     clear_old_signatures(app)?;
 
@@ -107,23 +109,34 @@ fn entitlements(
     profile: &ProvisioningProfile,
     special: &Option<SpecialApp>,
     team: &DeveloperTeam,
+    embedded_host: bool,
 ) -> Dictionary {
     let mut entitlements = profile.entitlements().clone();
 
     if matches!(
         special,
         Some(SpecialApp::SideStoreLc) | Some(SpecialApp::LiveContainer)
-    ) {
+    ) || embedded_host {
+        let prefix = if embedded_host { "com.aault.livecontainer.sideinstaller.shared" }
+                     else { "com.kdt.livecontainer.shared" };
         let mut keychain_access = vec![plist::Value::String(format!(
-            "{}.com.kdt.livecontainer.shared",
-            team.team_id
+            "{}.{}",
+            team.team_id, prefix
         ))];
 
         for number in 1..128 {
             keychain_access.push(plist::Value::String(format!(
-                "{}.com.kdt.livecontainer.shared.{}",
-                team.team_id, number
+                "{}.{}.{}",
+                team.team_id, prefix, number
             )));
+        }
+
+        if embedded_host {
+            // Preserve items a sideloader put in this host's own default group.
+            // Never add stock LC's groups or a wildcard to the isolated host.
+            if let Some(app_id) = entitlements.get("application-identifier").and_then(plist::Value::as_string) {
+                keychain_access.push(plist::Value::String(app_id.to_owned()));
+            }
         }
 
         entitlements.insert(

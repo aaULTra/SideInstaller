@@ -23,6 +23,7 @@ final class UpdateChecker: ObservableObject {
 
     /// Fetch the remote version and reveal the banner if it's newer.
     func check() async {
+        #if !SIDEINSTALLER_EMBEDDED
         guard let url = URL(string: Self.versionFileURL) else { return }
         var req = URLRequest(url: url)
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -36,6 +37,7 @@ final class UpdateChecker: ObservableObject {
         guard !latest.isEmpty else { return }
         latestVersion = latest
         showBanner = Self.isNewer(latest, than: currentVersion)
+        #endif
     }
 
     /// Close the banner for this launch.

@@ -1239,6 +1239,15 @@ extension IPALibrary {
                        version: dict["CFBundleShortVersionString"] as? String)
     }
 
+    #if SIDEINSTALLER_EMBEDDED
+    static func embeddedRevision(at url: URL) -> String? {
+        guard let raw = infoPlist(inIPA: url),
+              let dict = try? PropertyListSerialization.propertyList(from: raw, format: nil) as? [String: Any],
+              dict["SIEmbeddedBuild"] as? Bool == true else { return nil }
+        return dict["SIEmbeddedSourceRevision"] as? String
+    }
+    #endif
+
     /// One file inside an IPA, for copying it out without unpacking the rest.
     struct ArchiveFile {
         /// Path inside the archive, e.g. "Payload/SideStore.app/Assets.car".

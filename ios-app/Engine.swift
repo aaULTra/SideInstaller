@@ -312,6 +312,9 @@ final class Engine: ObservableObject {
     private var askedLocalNetwork = false
 
     private var pipelineTask: Task<Void, Never>?
+    #if SIDEINSTALLER_EMBEDDED
+    private var embeddedInstallLease: EmbeddedRefreshLease?
+    #endif
     /// The IPA download a run starts as soon as the network is up, so it runs
     /// alongside pairing and sign-in instead of after them.
     private var prefetch: (source: InstallSource, channel: ReleaseChannel, version: String?,
@@ -592,6 +595,10 @@ final class Engine: ObservableObject {
             log("⛔️ Device IP \(deviceHost) is an address this iPhone already holds — that's the tunnel's own end, not the one to connect to. Check Settings › Advanced › Device IP (the default is 10.7.0.1).")
             return
         }
+        #if SIDEINSTALLER_EMBEDDED
+        do { embeddedInstallLease = try EmbeddedRefreshLease() }
+        catch { log("⛔️ \(error.localizedDescription)"); return }
+        #endif
         resetRun()
         isRunning = true
         log("=== Starting one-click install ===")
@@ -636,6 +643,9 @@ final class Engine: ObservableObject {
                 failActiveStep(to: .failed)
             }
             stopBackgroundWork()
+            #if SIDEINSTALLER_EMBEDDED
+            embeddedInstallLease = nil
+            #endif
             isRunning = false
             isCancelling = false
             pairingPIN = nil
@@ -1634,6 +1644,9 @@ final class Engine: ObservableObject {
                                      forMadeira: source == .madeira || Self.isMadeira(ipaPath: ipa))
             }
             signedAppPath = path
+            #if SIDEINSTALLER_EMBEDDED
+            await updateEmbeddedCertificateIfPossible()
+            #endif
             // Read the app's name from the signed bundle (imported IPAs have none before this).
             signedDisplayName = signedAppName()
             setStep(.sign, .done)
@@ -2173,6 +2186,65 @@ final class Engine: ObservableObject {
 
     // MARK: Success
 
+    #if SIDEINSTALLER_EMBEDDED
+    @MainActor
+    func shareCertificateWithLiveContainer() async throws -> String {
+        try await AppRefreshService.shared.withExclusiveOperation {
+            try await self.prepareRefresh()
+            return try await self.exportEmbeddedCertificate()
+        }
+    }
+
+    @MainActor
+    private func exportEmbeddedCertificate() async throws -> String {
+        guard let session = signSession else { throw EngineError.message(L("Not signed in.")) }
+        let (config, team) = try await onSignQueue {
+            // Read the selected team from the session itself, not a queued UI
+            // publication. The developer token is never returned or logged.
+            var json: UnsafeMutablePointer<CChar>?
+            var error: UnsafeMutablePointer<CChar>?
+            let rc = si_signing_account(session, &json, &error)
+            defer { json.map { si_string_free($0) }; error.map { si_string_free($0) } }
+            guard rc == 0, let json,
+                  let dict = try JSONSerialization.jsonObject(with: Data(String(cString: json).utf8)) as? [String: Any],
+                  let team = dict["team_id"] as? String else {
+                throw EngineError.message("Unable to read the selected signing team from the Apple session.")
+            }
+            return (try self.buildAccountConfig(session: session), team)
+        }
+        signingTeamID = team
+        let report = try SIEmbeddedBridge.storeCertificate(config: config, signingTeam: team)
+        log("Signing certificate shared with this combined LiveContainer. No Apple ID password was shared.")
+        return report
+    }
+
+    @MainActor
+    private func updateEmbeddedCertificateIfPossible() async {
+        do { _ = try await exportEmbeddedCertificate() }
+        catch { log("LiveContainer certificate hand-off: \(error.localizedDescription)") }
+    }
+
+    @MainActor
+    func repairEmbeddedHostSigning() async throws {
+        try await AppRefreshService.shared.withExclusiveOperation {
+            let host = try EmbeddedSigningIdentity.host()
+            guard let revision = host.bundle.object(forInfoDictionaryKey: "SIEmbeddedSourceRevision") as? String,
+                  let ipa = IPALibrary.scan().first(where: {
+                      IPALibrary.appInfo(at: $0.url)?.bundleID == EmbeddedSigningIdentity.baseID
+                        && IPALibrary.embeddedRevision(at: $0.url) == revision
+                  })?.url else {
+                throw EngineError.message("Import this updated build's original unsigned combined IPA using Custom .ipa first. Repair requires the exact build currently installed, with all extensions retained.")
+            }
+            try await self.prepareRefresh()
+            // Export also reads and validates the session's actual team.
+            _ = try await self.exportEmbeddedCertificate()
+            try Task.checkCancellation()
+            try await self.refreshInstalledApp(named: "LiveContainer + SI", ipaPath: ipa.path,
+                                               expectedEmbeddedHostID: host.id)
+        }
+    }
+    #endif
+
     @MainActor
     private func finishSuccess() {
         finished = true
@@ -2246,7 +2318,11 @@ final class Engine: ObservableObject {
 
     private static let localDevVPNScheme = "localdevvpn"
     /// The scheme LocalDevVPN is asked to return to, registered in Info.plist.
+    #if SIDEINSTALLER_EMBEDDED
+    private static let callbackScheme = "sideinstaller-embedded"
+    #else
     private static let callbackScheme = "sideinstaller"
+    #endif
 
     /// True when LocalDevVPN is installed. Only answerable because Info.plist
     /// lists its scheme under `LSApplicationQueriesSchemes`.
@@ -2658,7 +2734,7 @@ final class Engine: ObservableObject {
     /// over the existing copy. Bundle ID, team and certificate are unchanged, so
     /// installd treats it as an upgrade and app data is kept.
     @MainActor
-    func refreshInstalledApp(named name: String, ipaPath: String) async throws {
+    func refreshInstalledApp(named name: String, ipaPath: String, expectedEmbeddedHostID: String? = nil) async throws {
         guard let session = signSession else { throw EngineError.message(L("Not signed in.")) }
         let udid = deviceUDID ?? ""
         let device = deviceName ?? ""
@@ -2677,6 +2753,64 @@ final class Engine: ObservableObject {
             throw EngineError.message(L("Apple won't issue a signing certificate for this Apple ID: it reports that one already exists (error 7460). Revoke it under Tools › Certificates, then refresh again."))
         }
         defer { Self.discardSignedBundle(at: signed) }
+        #if SIDEINSTALLER_EMBEDDED
+        await updateEmbeddedCertificateIfPossible()
+        if let expectedEmbeddedHostID {
+            let bundle = Bundle(path: signed)
+            guard let bundle, bundle.bundleIdentifier == expectedEmbeddedHostID,
+                  bundle.object(forInfoDictionaryKey: "SIEmbeddedBuild") as? Bool == true,
+                  FileManager.default.fileExists(atPath: signed + "/PlugIns/LiveProcess.appex"),
+                  FileManager.default.fileExists(atPath: signed + "/Frameworks/SideInstallerApp.framework/SideInstaller") else {
+                throw EngineError.message("Repair stopped: the signed bundle ID, embedded app or LiveProcess is incorrect. Nothing was installed.")
+            }
+            let profile = try EmbeddedSigningIdentity.profile(at: bundle)
+            let host = try EmbeddedSigningIdentity.host()
+            guard let oldExecutable = host.bundle.executablePath,
+                  let oldXML = SIEmbeddedEntitlementsAtPath(oldExecutable),
+                  let oldEntitlements = try PropertyListSerialization.propertyList(from: Data(oldXML.utf8), format: nil) as? [String: Any],
+                  let oldGroups = oldEntitlements["keychain-access-groups"] as? [String] else {
+                throw EngineError.message("Repair stopped: the current host's keychain groups could not be read. Nothing was installed.")
+            }
+            var bundles = [bundle]
+            if let plugins = bundle.builtInPlugInsURL {
+                bundles += try FileManager.default.contentsOfDirectory(at: plugins, includingPropertiesForKeys: nil)
+                    .filter { $0.pathExtension == "appex" }.compactMap { Bundle(url: $0) }
+            }
+            for target in bundles {
+                guard let id = target.bundleIdentifier,
+                      id == host.id || id.hasPrefix(host.id + "."),
+                      let executable = target.executablePath,
+                      let xml = SIEmbeddedEntitlementsAtPath(executable),
+                      let entitlements = try PropertyListSerialization.propertyList(from: Data(xml.utf8), format: nil) as? [String: Any],
+                      entitlements["com.apple.developer.team-identifier"] as? String == host.team,
+                      entitlements["get-task-allow"] as? Bool == true,
+                      let groups = entitlements["keychain-access-groups"] as? [String],
+                      (0..<128).allSatisfy({ index in
+                          groups.contains(host.team + "." + EmbeddedSigningIdentity.baseID + ".shared" + (index == 0 ? "" : ".\(index)"))
+                      }),
+                      (entitlements["com.apple.security.application-groups"] as? [String] ?? [])
+                        .contains("group." + host.id) else {
+                    throw EngineError.message("Repair stopped: \(target.bundleURL.lastPathComponent) is missing its expected identity, development entitlement, shared app group or 128 isolated keychain groups. Nothing was installed.")
+                }
+                if target.bundleIdentifier == host.id,
+                   let newGroups = entitlements["keychain-access-groups"] as? [String] {
+                    let missing = oldGroups.filter { !newGroups.contains($0) }
+                    guard missing.isEmpty else {
+                        throw EngineError.message("Repair stopped to preserve Keychain access. The installed host has groups the new signature cannot retain: \(missing.joined(separator: ", ")). Nothing was installed.")
+                    }
+                }
+            }
+            // Re-read the identity that was just exported; ensure the newly
+            // issued profile authorises it before replacing the running host.
+            let config = try await onSignQueue { try self.buildAccountConfig(session: session) }
+            let dict = try JSONSerialization.jsonObject(with: Data(config.utf8)) as? [String: Any]
+            guard let encoded = dict?["certificateData"] as? String, let p12 = Data(base64Encoded: encoded),
+                  let password = dict?["certificatePassword"] as? String,
+                  EmbeddedSigningIdentity.permits(try EmbeddedSigningIdentity.certificate(p12: p12, password: password), profile: profile) else {
+                throw EngineError.message("Repair stopped: the new host profile does not authorise the signing certificate. Nothing was installed.")
+            }
+        }
+        #endif
         installProgress = 0
         let ip = deviceHost
         try await onDeviceQueue {
